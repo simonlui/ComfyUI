@@ -17,35 +17,15 @@ import comfy.utils
 from comfy.ldm.chroma_radiance.layers import NerfEmbedder
 
 
-def invert_slices(slices, length):
-    sorted_slices = sorted(slices)
-    result = []
-    current = 0
-
-    for start, end in sorted_slices:
-        if current < start:
-            result.append((current, start))
-        current = max(current, end)
-
-    if current < length:
-        result.append((current, length))
-
-    return result
-
 
 def modulate(x, scale, timestep_zero_index=None):
     if timestep_zero_index is None:
         return x * (1 + scale.unsqueeze(1))
     else:
-        scale = (1 + scale.unsqueeze(1))
+        scale = scale.unsqueeze(1) + 1.0
         actual_batch = scale.size(0) // 2
-        slices = timestep_zero_index
-        invert = invert_slices(timestep_zero_index, x.shape[1])
-        for s in slices:
-            x[:, s[0]:s[1]] *= scale[actual_batch:]
-        for s in invert:
-            x[:, s[0]:s[1]] *= scale[:actual_batch]
-        return x
+        scale_combined = torch.where(timestep_zero_index, scale[actual_batch:], scale[:actual_batch])
+        return x * scale_combined
 
 
 def apply_gate(gate, x, timestep_zero_index=None):
@@ -53,14 +33,8 @@ def apply_gate(gate, x, timestep_zero_index=None):
         return gate * x
     else:
         actual_batch = gate.size(0) // 2
-
-        slices = timestep_zero_index
-        invert = invert_slices(timestep_zero_index, x.shape[1])
-        for s in slices:
-            x[:, s[0]:s[1]] *= gate[actual_batch:]
-        for s in invert:
-            x[:, s[0]:s[1]] *= gate[:actual_batch]
-        return x
+        gate_combined = torch.where(timestep_zero_index, gate[actual_batch:], gate[:actual_batch])
+        return gate_combined * x
 
 #############################################################################
 #                               Core NextDiT Model                              #
@@ -68,7 +42,7 @@ def apply_gate(gate, x, timestep_zero_index=None):
 
 def clamp_fp16(x):
     if x.dtype == torch.float16:
-        return torch.nan_to_num(x, nan=0.0, posinf=65504, neginf=-65504)
+        return torch.nan_to_num(x, nan=0.0, posinf=65504.0, neginf=-65504.0)
     return x
 
 class JointAttention(nn.Module):
@@ -157,10 +131,9 @@ class JointAttention(nn.Module):
 
         xq, xk = apply_rope(xq, xk, freqs_cis)
 
-        n_rep = self.n_local_heads // self.n_local_kv_heads
-        if n_rep >= 1:
-            xk = xk.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
-            xv = xv.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+        if self.n_rep > 1:
+            xk = xk.repeat_interleave(self.n_rep, dim=2)
+            xv = xv.repeat_interleave(self.n_rep, dim=2)
         output = optimized_attention_masked(xq.movedim(1, 2), xk.movedim(1, 2), xv.movedim(1, 2), self.n_local_heads, x_mask, skip_reshape=True, transformer_options=transformer_options)
 
         return self.out(output)
@@ -399,7 +372,10 @@ class FinalLayer(nn.Module):
 
 def pad_zimage(feats, pad_token, pad_tokens_multiple):
     pad_extra = (-feats.shape[1]) % pad_tokens_multiple
-    return torch.cat((feats, pad_token.to(device=feats.device, dtype=feats.dtype, copy=True).unsqueeze(0).repeat(feats.shape[0], pad_extra, 1)), dim=1), pad_extra
+    if pad_extra == 0:
+        return feats, 0
+    pad_expansion = pad_token.to(device=feats.device, dtype=feats.dtype).unsqueeze(0).expand(feats.shape[0], pad_extra, -1)
+    return torch.cat((feats, pad_expansion), dim=1), pad_extra
 
 
 def pos_ids_x(start_t, H_tokens, W_tokens, batch_size, device, transformer_options={}):
@@ -414,11 +390,10 @@ def pos_ids_x(start_t, H_tokens, W_tokens, batch_size, device, transformer_optio
 
         h_start = rope_options.get("shift_y", 0.0)
         w_start = rope_options.get("shift_x", 0.0)
-    x_pos_ids = torch.zeros((batch_size, H_tokens * W_tokens, 3), dtype=torch.float32, device=device)
-    x_pos_ids[:, :, 0] = start_t
-    x_pos_ids[:, :, 1] = (torch.arange(H_tokens, dtype=torch.float32, device=device) * h_scale + h_start).view(-1, 1).repeat(1, W_tokens).flatten()
-    x_pos_ids[:, :, 2] = (torch.arange(W_tokens, dtype=torch.float32, device=device) * w_scale + w_start).view(1, -1).repeat(H_tokens, 1).flatten()
-    return x_pos_ids
+    t_ids = torch.full((batch_size, H_tokens * W_tokens), start_t, dtype=torch.float32, device=device)
+    h_ids = (torch.arange(H_tokens, dtype=torch.float32, device=device) * h_scale + h_start).view(-1, 1).expand(-1, W_tokens).flatten().expand(batch_size, -1)
+    w_ids = (torch.arange(W_tokens, dtype=torch.float32, device=device) * w_scale + w_start).view(1, -1).expand(H_tokens, -1).flatten().expand(batch_size, -1)
+    return torch.stack((t_ids, h_ids, w_ids), dim=-1)
 
 
 class NextDiT(nn.Module):
@@ -645,10 +620,11 @@ class NextDiT(nn.Module):
                 cap_feats, _ = pad_zimage(cap_feats, self.cap_pad_token, self.pad_tokens_multiple)
         else:
             cap_feats_len = 0
-            cap_feats = self.cap_pad_token.to(device=device, dtype=dtype, copy=True).unsqueeze(0).repeat(bsz, self.pad_tokens_multiple, 1)
+            cap_feats = self.cap_pad_token.to(device=device, dtype=dtype).unsqueeze(0).expand(bsz, self.pad_tokens_multiple, -1)
 
-        cap_pos_ids = torch.zeros(bsz, cap_feats.shape[1], 3, dtype=torch.float32, device=device)
-        cap_pos_ids[:, :, 0] = torch.arange(cap_feats.shape[1], dtype=torch.float32, device=device) + 1.0 + offset
+        zeros = torch.zeros(bsz, cap_feats.shape[1], dtype=torch.float32, device=device)
+        t_ids = (torch.arange(cap_feats.shape[1], dtype=torch.float32, device=device) + 1.0 + offset).unsqueeze(0).expand(bsz, -1)
+        cap_pos_ids = torch.stack((t_ids, zeros, zeros), dim=-1)
         embeds = (cap_feats,)
         freqs_cis = (self.rope_embedder(cap_pos_ids).movedim(1, 2),)
         return embeds, freqs_cis, cap_feats_len
@@ -669,16 +645,16 @@ class NextDiT(nn.Module):
                 b, h, w, c = siglip_feats.shape
                 siglip_feats = siglip_feats.permute(0, 3, 1, 2).reshape(b, h * w, c)
                 siglip_feats = self.siglip_embedder(siglip_feats)
-                siglip_pos_ids = torch.zeros((bsz, siglip_feats.shape[1], 3), dtype=torch.float32, device=device)
-                siglip_pos_ids[:, :, 0] = cap_feats_len + 2
-                siglip_pos_ids[:, :, 1] = (torch.linspace(0, h * 8 - 1, steps=h, dtype=torch.float32, device=device).floor()).view(-1, 1).repeat(1, w).flatten()
-                siglip_pos_ids[:, :, 2] = (torch.linspace(0, w * 8 - 1, steps=w, dtype=torch.float32, device=device).floor()).view(1, -1).repeat(h, 1).flatten()
+                t_ids = torch.full((bsz, siglip_feats.shape[1]), cap_feats_len + 2, dtype=torch.float32, device=device)
+                h_ids = (torch.linspace(0, h * 8 - 1, steps=h, dtype=torch.float32, device=device).floor()).view(-1, 1).expand(-1, w).flatten().expand(bsz, -1)
+                w_ids = (torch.linspace(0, w * 8 - 1, steps=w, dtype=torch.float32, device=device).floor()).view(1, -1).expand(h, -1).flatten().expand(bsz, -1)
+                siglip_pos_ids = torch.stack((t_ids, h_ids, w_ids), dim=-1)
                 if self.siglip_pad_token is not None:
                     siglip_feats, pad_extra = pad_zimage(siglip_feats, self.siglip_pad_token, self.pad_tokens_multiple)  # TODO: double check
                     siglip_pos_ids = torch.nn.functional.pad(siglip_pos_ids, (0, 0, 0, pad_extra))
             else:
                 if self.siglip_pad_token is not None:
-                    siglip_feats = self.siglip_pad_token.to(device=device, dtype=x.dtype, copy=True).unsqueeze(0).repeat(bsz, self.pad_tokens_multiple, 1)
+                    siglip_feats = self.siglip_pad_token.to(device=device, dtype=x.dtype).unsqueeze(0).expand(bsz, self.pad_tokens_multiple, -1)
                     siglip_pos_ids = torch.zeros((bsz, siglip_feats.shape[1], 3), dtype=torch.float32, device=device)
 
             if siglip_feats is None:
@@ -793,8 +769,15 @@ class NextDiT(nn.Module):
         padded_full_embed = torch.cat(feats + (x,), dim=1)
         if timestep_zero_index is not None:
             ind = padded_full_embed.shape[1] - x.shape[1]
-            timestep_zero_index = [(ind + x.shape[1] - img_len, ind + x.shape[1])]
-            timestep_zero_index.append((feats[0].shape[1] - cap_len, feats[0].shape[1]))
+            slices = [
+                (ind + x.shape[1] - img_len, ind + x.shape[1]),
+                (feats[0].shape[1] - cap_len, feats[0].shape[1])
+            ]
+            seq_len = padded_full_embed.shape[1]
+            ts_mask = torch.zeros((1, seq_len, 1), dtype=torch.bool, device=padded_full_embed.device)
+            for s in slices:
+                ts_mask[:, s[0]:s[1], :] = True
+            timestep_zero_index = ts_mask
 
         mask = None
         l_effective_cap_len = [padded_full_embed.shape[1] - img_len] * bsz
@@ -811,7 +794,7 @@ class NextDiT(nn.Module):
     def _forward(self, x, timesteps, context, num_tokens, attention_mask=None, ref_latents=[], ref_contexts=[], siglip_feats=[], transformer_options={}, **kwargs):
         omni = len(ref_latents) > 0
         if omni:
-            timesteps = torch.cat([timesteps * 0, timesteps], dim=0)
+            timesteps = torch.cat([torch.zeros_like(timesteps), timesteps], dim=0)
 
         t = 1.0 - timesteps
         cap_feats = context
@@ -1031,7 +1014,7 @@ class NextDiTPixelSpace(NextDiT):
     def _forward(self, x, timesteps, context, num_tokens, attention_mask=None, ref_latents=[], ref_contexts=[], siglip_feats=[], transformer_options={}, **kwargs):
         omni = len(ref_latents) > 0
         if omni:
-            timesteps = torch.cat([timesteps * 0, timesteps], dim=0)
+            timesteps = torch.cat([torch.zeros_like(timesteps), timesteps], dim=0)
 
         t = 1.0 - timesteps
         cap_feats = context
