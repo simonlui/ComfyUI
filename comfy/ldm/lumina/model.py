@@ -131,10 +131,16 @@ class JointAttention(nn.Module):
 
         xq, xk = apply_rope(xq, xk, freqs_cis)
 
+        # Move dims before interleaving so repeat_interleave operates on
+        # contiguous head blocks: (B, seq, heads, dim) -> (B, heads, seq, dim)
+        xq = xq.movedim(1, 2)
+        xk = xk.movedim(1, 2)
+        xv = xv.movedim(1, 2)
+
         if self.n_rep > 1:
-            xk = xk.repeat_interleave(self.n_rep, dim=2)
-            xv = xv.repeat_interleave(self.n_rep, dim=2)
-        output = optimized_attention_masked(xq.movedim(1, 2), xk.movedim(1, 2), xv.movedim(1, 2), self.n_local_heads, x_mask, skip_reshape=True, transformer_options=transformer_options)
+            xk = xk.repeat_interleave(self.n_rep, dim=1)
+            xv = xv.repeat_interleave(self.n_rep, dim=1)
+        output = optimized_attention_masked(xq, xk, xv, self.n_local_heads, x_mask, skip_reshape=True, transformer_options=transformer_options)
 
         return self.out(output)
 
@@ -166,6 +172,8 @@ class FeedForward(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
+        self.use_clamp = (operation_settings.get("dtype") == torch.float16)
+
         self.w1 = operation_settings.get("operations").Linear(
             dim,
             hidden_dim,
@@ -190,7 +198,10 @@ class FeedForward(nn.Module):
 
     # @torch.compile
     def _forward_silu_gating(self, x1, x3):
-        return clamp_fp16(F.silu(x1) * x3)
+        out = F.silu(x1) * x3
+        if self.use_clamp:
+            return torch.nan_to_num(out, nan=0.0, posinf=65504.0, neginf=-65504.0)
+        return out
 
     def forward(self, x):
         return self.w2(self._forward_silu_gating(self.w1(x), self.w3(x)))
@@ -246,6 +257,7 @@ class JointTransformerBlock(nn.Module):
         self.ffn_norm2 = operation_settings.get("operations").RMSNorm(dim, eps=norm_eps, elementwise_affine=True, device=operation_settings.get("device"), dtype=operation_settings.get("dtype"))
 
         self.modulation = modulation
+        self.use_clamp = (operation_settings.get("dtype") == torch.float16)
         if modulation:
             if z_image_modulation:
                 self.adaLN_modulation = nn.Sequential(
@@ -294,29 +306,33 @@ class JointTransformerBlock(nn.Module):
             assert adaln_input is not None
             scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(adaln_input).chunk(4, dim=1)
 
-            x = x + apply_gate(gate_msa.unsqueeze(1).tanh(), self.attention_norm2(
-                clamp_fp16(self.attention(
-                    modulate(self.attention_norm1(x), scale_msa, timestep_zero_index=timestep_zero_index),
-                    x_mask,
-                    freqs_cis,
-                    transformer_options=transformer_options,
-                ))), timestep_zero_index=timestep_zero_index
+            attn_out = self.attention(
+                modulate(self.attention_norm1(x), scale_msa, timestep_zero_index=timestep_zero_index),
+                x_mask,
+                freqs_cis,
+                transformer_options=transformer_options,
             )
-            x = x + apply_gate(gate_mlp.unsqueeze(1).tanh(), self.ffn_norm2(
-                clamp_fp16(self.feed_forward(
-                    modulate(self.ffn_norm1(x), scale_mlp, timestep_zero_index=timestep_zero_index),
-                ))), timestep_zero_index=timestep_zero_index
+            if self.use_clamp:
+                attn_out = torch.nan_to_num(attn_out, nan=0.0, posinf=65504.0, neginf=-65504.0)
+            x = x + apply_gate(gate_msa.unsqueeze(1).tanh(), self.attention_norm2(attn_out), timestep_zero_index=timestep_zero_index)
+
+            ff_out = self.feed_forward(
+                modulate(self.ffn_norm1(x), scale_mlp, timestep_zero_index=timestep_zero_index),
             )
+            if self.use_clamp:
+                ff_out = torch.nan_to_num(ff_out, nan=0.0, posinf=65504.0, neginf=-65504.0)
+            x = x + apply_gate(gate_mlp.unsqueeze(1).tanh(), self.ffn_norm2(ff_out), timestep_zero_index=timestep_zero_index)
         else:
             assert adaln_input is None
-            x = x + self.attention_norm2(
-                clamp_fp16(self.attention(
-                    self.attention_norm1(x),
-                    x_mask,
-                    freqs_cis,
-                    transformer_options=transformer_options,
-                ))
+            attn_out = self.attention(
+                self.attention_norm1(x),
+                x_mask,
+                freqs_cis,
+                transformer_options=transformer_options,
             )
+            if self.use_clamp:
+                attn_out = torch.nan_to_num(attn_out, nan=0.0, posinf=65504.0, neginf=-65504.0)
+            x = x + self.attention_norm2(attn_out)
             x = x + self.ffn_norm2(
                 self.feed_forward(
                     self.ffn_norm1(x),
@@ -704,7 +720,7 @@ class NextDiT(nn.Module):
                 out = self.embed_all(ref, ref_con, sig_feat, offset=start_t, omni=omni, transformer_options=transformer_options)
                 for i, e in enumerate(out[0]):
                     if e is not None:
-                        embeds[i].append(comfy.utils.repeat_to_batch_size(e, bsz))
+                        embeds[i].append(e.expand(bsz, -1, -1))
                         freqs_cis[i].append(out[1][i])
                 start_t = out[2]
             leftover_cap = ref_contexts[len(ref_latents):]
@@ -716,7 +732,7 @@ class NextDiT(nn.Module):
         cap_len = out[0][0].shape[1]
         for i, e in enumerate(out[0]):
             if e is not None:
-                e = comfy.utils.repeat_to_batch_size(e, bsz)
+                e = e.expand(bsz, -1, -1)
                 embeds[i].append(e)
                 freqs_cis[i].append(out[1][i])
         start_t = out[2]
@@ -724,7 +740,7 @@ class NextDiT(nn.Module):
         for cap in leftover_cap:
             out = self.embed_cap(cap, offset=start_t, bsz=bsz, device=x.device, dtype=x.dtype)
             cap_len += out[0][0].shape[1]
-            embeds[0].append(comfy.utils.repeat_to_batch_size(out[0][0], bsz))
+            embeds[0].append(out[0][0].expand(bsz, -1, -1))
             freqs_cis[0].append(out[1][0])
             start_t += out[2]
 
